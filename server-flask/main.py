@@ -1,11 +1,18 @@
 import os
 from datetime import datetime
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_migrate import Migrate
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+
 from passlib.hash import bcrypt
+
 from models import db, User, Teacher, Student, Course, Subject, CourseSubject, Assignment, Question, QuestionOption, QuestionScale, Submission, Answer, Notification
+from ai_service import gemini_service
+from routes import api_bp
+from reminder_service import reminder_service
+
 from dotenv import load_dotenv
 
 
@@ -24,6 +31,12 @@ def create_app():
     db.init_app(app)
     migrate = Migrate(app, db)
     jwt = JWTManager(app)
+    
+    # Registrar blueprint con las rutas adicionales
+    app.register_blueprint(api_bp)
+    
+    # Inicializar servicio de recordatorios
+    reminder_service.init_app(app)
 
 
     @app.route('/')
@@ -194,6 +207,7 @@ def create_app():
     @app.route('/api/assignments/<int:assignment_id>/submit', methods=['POST'])
     @role_required('student')
     def submit_assignment(assignment_id):
+        """CU-12 & CU-13: Resolver y enviar tarea con confirmación automática"""
         identity = get_jwt_identity()
         student_user_id = identity.get('user_id')
         # find student record
@@ -212,7 +226,32 @@ def create_app():
                 ans = Answer(submission_id=sub.id, question_id=a.get('question_id'), selected_options=a.get('selected_options'), text_answer=a.get('text_answer'), numeric_answer=a.get('numeric_answer'))
                 db.session.add(ans)
         db.session.commit()
-        return jsonify({'submission_id': sub.id}), 201
+        
+        # CU-13: Confirmación automática - Notificar al estudiante
+        confirmation_notification = Notification(
+            user_id=student_user_id,
+            message=f'Tu entrega para "{sub.assignment.title}" ha sido recibida exitosamente'
+        )
+        db.session.add(confirmation_notification)
+        
+        # Notificar al profesor
+        assignment = Assignment.query.get(assignment_id)
+        if assignment and assignment.course_subject and assignment.course_subject.course and assignment.course_subject.course.teacher:
+            teacher = assignment.course_subject.course.teacher
+            if teacher.user:
+                teacher_notification = Notification(
+                    user_id=teacher.user.id,
+                    message=f'Nueva entrega de {student.user.username} para "{assignment.title}"'
+                )
+                db.session.add(teacher_notification)
+        
+        db.session.commit()
+        
+        return jsonify({
+            'submission_id': sub.id,
+            'confirmation': 'Entrega recibida exitosamente',
+            'submission_date': sub.submission_date.isoformat()
+        }), 201
 
 
     @app.route('/api/submissions/<int:submission_id>/grade', methods=['POST'])
@@ -234,27 +273,65 @@ def create_app():
     @app.route('/api/submissions/<int:submission_id>/ai_feedback', methods=['POST'])
     @role_required('teacher')
     def generate_ai_feedback(submission_id):
-        # Placeholder: basic heuristic-based feedback. Replace with real model integration.
+        """CU-07: Generar retroalimentación con Gemini AI"""
         sub = Submission.query.get(submission_id)
         if not sub:
             return jsonify({'msg': 'submission not found'}), 404
-        # Simple heuristic: score based on length of text answers
-        answers = sub.answers
-        total_len = 0
-        count = 0
-        for a in answers:
-            if a.text_answer:
-                total_len += len(a.text_answer)
-                count += 1
-        ai_score = None
-        if count > 0:
-            avg_len = total_len / count
-            # map avg_len to 0-100 roughly
-            ai_score = min(100, int(min(1.0, avg_len / 500.0) * 100))
-        sub.ai_score = ai_score
-        sub.ai_feedback = f'AI feedback placeholder. avg_text_len={avg_len if count>0 else 0}'
-        db.session.commit()
-        return jsonify({'ai_score': ai_score, 'ai_feedback': sub.ai_feedback}), 200
+        
+        # Preparar datos para el análisis
+        assignment = sub.assignment
+        questions = []
+        answers = []
+        
+        for answer in sub.answers:
+            question = Question.query.get(answer.question_id)
+            if question:
+                questions.append({
+                    'text': question.text,
+                    'type': question.type,
+                    'id': question.id
+                })
+                answers.append({
+                    'question_id': answer.question_id,
+                    'text_answer': answer.text_answer,
+                    'selected_options': answer.selected_options,
+                    'numeric_answer': float(answer.numeric_answer) if answer.numeric_answer else None
+                })
+        
+        submission_data = {
+            'assignment_title': assignment.title,
+            'assignment_description': assignment.description or '',
+            'questions': questions,
+            'answers': answers
+        }
+        
+        # Llamar al servicio de Gemini AI
+        try:
+            ai_result = gemini_service.analyze_submission(submission_data)
+            
+            if ai_result.get('analysis_complete'):
+                sub.ai_feedback = ai_result['feedback']
+                sub.ai_score = ai_result.get('suggested_score')
+                db.session.commit()
+                
+                return jsonify({
+                    'ai_score': ai_result.get('suggested_score'),
+                    'ai_feedback': ai_result['feedback'],
+                    'success': True
+                }), 200
+            else:
+                return jsonify({
+                    'msg': 'Error generating AI feedback',
+                    'error': ai_result.get('error'),
+                    'success': False
+                }), 500
+                
+        except Exception as e:
+            return jsonify({
+                'msg': 'Error calling AI service',
+                'error': str(e),
+                'success': False
+            }), 500
 
 
     # --- Notifications ---
